@@ -1,0 +1,10 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+# Configures Cargo to automatically flash the target MCU and output 'defmt' logs
+runner = "probe-rs run --chip STM32F469NIHx"
+rustflags = [
+  "-C", "link-arg=-Tlink.x",
+  "-C", "link-arg=-Tdefmt.x",
+]
