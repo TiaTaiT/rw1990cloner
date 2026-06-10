@@ -61,24 +61,48 @@ impl<'d> Rw1990<'d> {
     pub fn write_bit(&mut self, bit: bool, delay: &mut Delay) {
         if bit {
             self.pin.set_low();
-            delay.delay_us(6);
+            delay.delay_us(4);  // Short pulse for '1'
+            self.pin.set_high(); // Release line
+            
+            // --- ACTIVE PULL-UP ---
+            // Briefly switch to Push-Pull output to instantly blast power into the clone
+            self.pin.set_as_output(Speed::VeryHigh);
             self.pin.set_high();
-            delay.delay_us(64);
+            delay.delay_us(3);
+            // Switch back to Open-Drain
+            self.pin.set_as_input_output(Speed::VeryHigh); 
+            // ----------------------
+            
+            delay.delay_us(67); 
         } else {
             self.pin.set_low();
-            delay.delay_us(60);
+            delay.delay_us(60); // Long pulse for '0' drains the clone's power
+            self.pin.set_high(); // Release line
+            
+            // --- ACTIVE PULL-UP ---
+            // Instantly recharge the clone's dead capacitor
+            self.pin.set_as_output(Speed::VeryHigh);
             self.pin.set_high();
-            delay.delay_us(10);
+            delay.delay_us(3);
+            self.pin.set_as_input_output(Speed::VeryHigh); 
+            // ----------------------
+            
+            delay.delay_us(37); 
         }
     }
 
     pub fn read_bit(&mut self, delay: &mut Delay) -> bool {
         self.pin.set_low();
-        delay.delay_us(6);
-        self.pin.set_high();
-        delay.delay_us(9);
-        let bit = self.pin.is_high();
-        delay.delay_us(55);
+        delay.delay_us(2);   // Shortest possible pulse to initiate read
+        self.pin.set_high(); // Release the open-drain line
+        
+        delay.delay_us(11);  // Wait precisely for Flipper Zero standard sample time
+        let bit = self.pin.is_high(); // Sample the line
+        
+        // INCREASED FROM 55us TO 60us!
+        // Gives the clone extra time to release the line and recharge between bits.
+        delay.delay_us(60);  
+        
         bit
     }
 
@@ -113,6 +137,78 @@ impl<'d> Rw1990<'d> {
             self.pin.set_high();
         }
         Timer::after_millis(10).await; // Pause for EEPROM cell programming
+    }
+
+    /// Protocol for TM2004 / RW2004 keys
+    pub async fn write_tm2004_id(&mut self, new_id: &[u8; 8], delay: &mut Delay) -> bool {
+        // 1. TM2004 requires a standard Read ROM (0x33) to transition to extended mode
+        if !self.reset(delay) { return false; }
+        self.write_byte(0x33, delay);
+        for _ in 0..8 {
+            self.read_byte(delay);
+        }
+        
+        // 2. Command 0x3C is Write ROM for TM2004
+        if !self.reset(delay) { return false; }
+        self.write_byte(0x3C, delay);
+        
+        for byte in new_id {
+            // TM2004 uses STANDARD 1-Wire write timings (not inverted!)
+            for i in 0..8 {
+                let bit = (byte >> i) & 1 != 0;
+                
+                // Write standard bit, but we add an EEPROM delay afterward
+                if bit {
+                    self.pin.set_low(); delay.delay_us(6); self.pin.set_high(); delay.delay_us(64);
+                } else {
+                    self.pin.set_low(); delay.delay_us(60); self.pin.set_high(); delay.delay_us(10);
+                }
+                
+                Timer::after_millis(10).await; // 10ms for EEPROM burn
+            }
+        }
+        
+        self.reset(delay);
+        true
+    }
+
+    /// Protocol for RW1990.2 keys
+    pub async fn write_rw1990_2_id(&mut self, new_id: &[u8; 8], delay: &mut Delay) -> bool {
+        // 1. Enable Write Mode: Send Command 0x1D, then a LONG pulse (true)
+        if !self.reset(delay) { return false; }
+        self.write_byte(0x1D, delay);
+        self.write_rw1990_bit(true, delay).await;
+
+        // 2. Transmit ROM ID payload (0xD5 + 64-bit ID)
+        if !self.reset(delay) { return false; }
+        self.write_byte(0xD5, delay);
+        for byte in new_id {
+            for bit_idx in 0..8 {
+                let bit = (byte >> bit_idx) & 1 != 0;
+                self.write_rw1990_bit(bit, delay).await;
+            }
+        }
+
+        // 3. Disable Write Mode (Lock): Send Command 0x1D, then a SHORT pulse (false)
+        if !self.reset(delay) { return false; }
+        self.write_byte(0x1D, delay);
+        self.write_rw1990_bit(false, delay).await;
+        
+        self.reset(delay);
+        true
+    }
+    
+    // Helper to read and verify ID against what we just wrote
+    pub fn verify_id(&mut self, target_id: &[u8; 8], delay: &mut Delay) -> bool {
+        if self.reset(delay) {
+            self.write_byte(0x33, delay);
+            let mut read_back = [0u8; 8];
+            for byte in read_back.iter_mut() {
+                *byte = self.read_byte(delay);
+            }
+            return &read_back == target_id;
+        }
+        false
     }
 
     pub async fn write_clone_id(&mut self, new_id: &[u8; 8], delay: &mut Delay) -> bool {
@@ -201,36 +297,44 @@ async fn main(_spawner: Spawner) {
             let mut timeout = 0;
             loop {
                 if cloner.reset(&mut delay) {
-                    info!("Writing ID to target...");
-                    
+                    info!("Attempting to write...");
+                    let mut success = false;
+    
+                    // Attempt 1: Standard RW1990.1
                     if cloner.write_clone_id(&saved_key, &mut delay).await {
-                        // Read back from the target to verify the write operation
-                        if cloner.reset(&mut delay) {
-                            cloner.write_byte(0x33, &mut delay);
-                            let mut read_back = [0u8; 8];
-                            for byte in read_back.iter_mut() {
-                                *byte = cloner.read_byte(&mut delay);
-                            }
-                            
-                            if read_back == saved_key {
-                                info!("SUCCESS! Verification match.");
-                                // Turn on LD4 (Blue) for 2 seconds to indicate successful write
-                                ld4.set_high();
-                                Timer::after_secs(2).await;
-                                ld4.set_low();
-                            } else {
-                                error!("FAILED! Verification mismatch. Read: {:?}", read_back);
-                                // Flash LD4 (Blue) rapidly to signal write verify error
-                                for _ in 0..5 {
-                                    ld4.set_high();
-                                    Timer::after_millis(100).await;
-                                    ld4.set_low();
-                                    Timer::after_millis(100).await;
-                                }
-                            }
+                        if cloner.verify_id(&saved_key, &mut delay) {
+                            info!("SUCCESS using RW1990.1 Protocol.");
+                            success = true;
                         }
+                    }
+
+                    // Attempt 2: TM2004 / RW2004
+                    if !success && cloner.write_tm2004_id(&saved_key, &mut delay).await {
+                        if cloner.verify_id(&saved_key, &mut delay) {
+                            info!("SUCCESS using TM2004 Protocol.");
+                            success = true;
+                        }
+                    }
+
+                    // Attempt 3: RW1990.2
+                    if !success && cloner.write_rw1990_2_id(&saved_key, &mut delay).await {
+                        if cloner.verify_id(&saved_key, &mut delay) {
+                            info!("SUCCESS using RW1990.2 Protocol.");
+                            success = true;
+                        }
+                    }
+
+                    if success {
+                        // Blink LED Blue for success
+                        ld4.set_high();
+                        Timer::after_secs(2).await;
+                        ld4.set_low();
                     } else {
-                        error!("Write operation failed to start.");
+                        error!("FAILED! Key rejected all known write protocols.");
+                        for _ in 0..5 {
+                            ld4.set_high(); Timer::after_millis(100).await;
+                            ld4.set_low(); Timer::after_millis(100).await;
+                        }
                     }
                     break;
                 }
@@ -270,7 +374,10 @@ async fn main(_spawner: Spawner) {
                     Timer::after_secs(2).await;
                     ld3.set_low();
                 } else {
-                    warn!("Bad CRC or line noise.");
+                    warn!("Bad CRC or line noise. Read: {:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}:{:02X}", 
+                        buf[0], buf[1], buf[2], buf[3],
+                        buf[4], buf[5], buf[6], buf[7]
+                    );
                     Timer::after_millis(500).await;
                 }
             }
